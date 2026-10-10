@@ -20,6 +20,12 @@ each sample's length uniformly from ``--train_len`` (0 to 2k). After every stage
 model is evaluated at each of ``--eval_lens``, which goes on to 4k and 8k, lengths it
 never trained on. Writes ``stage<k>.pt`` after each stage and ``metrics.jsonl``.
 ``--start_stage 2`` continues from ``stage1.pt`` in the same folder.
+
+With ``--mode online`` (or ``offline``) the run is tracked in Weights & Biases against
+the optimizer step: ``train/loss`` and ``train/lr`` every ``--log_every`` steps,
+``val/loss``, ``val/accuracy`` and ``val/accuracy/qa<N>`` every epoch, and
+``eval/accuracy/len<L>`` (with ``eval/len<L>/qa<N>``) after every stage. The default
+``--mode disabled`` logs nothing and needs no login.
 """
 
 import argparse
@@ -31,6 +37,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import wandb
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
 
@@ -206,7 +213,9 @@ def main():
     p.add_argument("--pe", default="none", choices=PE_TYPES, help="transformer_mask only")
     p.add_argument("--babi_dir", default="data/tasks_1-20_v1-2/en-valid-10k",
                    help="folder with qa<N>_train.txt and qa<N>_valid.txt")
-    p.add_argument("--noise_dataset", default="pg19")
+    p.add_argument("--noise_dataset", default="emozilla/pg19",
+                   help="PG19 as parquet files: deepmind/pg19 is a loading script, which "
+                        "datasets>=3 refuses to run")
     p.add_argument("--train_len", type=int, nargs=2, default=[0, 2000], metavar=("LOW", "HIGH"),
                    help="each training sample's length is drawn uniformly from this range")
     p.add_argument("--eval_lens", type=int, nargs="+", default=[0, 1000, 2000, 4000, 8000],
@@ -228,6 +237,13 @@ def main():
     p.add_argument("--log_every", type=int, default=200)
     p.add_argument("--seed", type=int, default=43)
     p.add_argument("--output_dir", required=True)
+    g = p.add_argument_group("wandb")
+    g.add_argument("--project", default="Babilong_nopos")
+    g.add_argument("--entity", default=None, help="wandb team or user; default is yours.")
+    g.add_argument("--group", default=None)
+    g.add_argument("--run_name", default=None, help="Default: the output folder's name.")
+    g.add_argument("--mode", default="disabled", choices=["online", "offline", "disabled"],
+                   help="offline writes the run locally for a later `wandb sync`.")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -262,6 +278,12 @@ def main():
         noise = {split: load_dataset(args.noise_dataset, split=split) for split in ("train", "validation")}
 
     metrics_path = os.path.join(args.output_dir, "metrics.jsonl")
+    # mode="disabled" gives a no-op run, so nothing below depends on the mode. A run
+    # continued with --start_stage is a new wandb run that carries on at the same step.
+    run = wandb.init(project=args.project, entity=args.entity, group=args.group,
+                     name=args.run_name or os.path.basename(os.path.normpath(args.output_dir)),
+                     mode=args.mode, job_type="train_stages",
+                     config=dict(vars(args), stages=STAGES, description=model.description))
     for stage in range(args.start_stage, len(STAGES) + 1):
         tasks = sorted(t for s in STAGES[:stage] for t in s)
         train_loader = make_loader(args, tokenizer, tasks, "train", noise.get("train"), args.train_len,
@@ -277,8 +299,9 @@ def main():
             running = []
             for i, batch in enumerate(train_loader, 1):
                 # Linear warmup once, at the start of the run; constant afterwards.
+                lr = args.lr * min(1.0, (step + 1) / args.warmup_steps)
                 for group in optimizer.param_groups:
-                    group["lr"] = args.lr * min(1.0, (step + 1) / args.warmup_steps)
+                    group["lr"] = lr
                 loss = forward(model, criterion, batch, device)[0]
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -292,6 +315,8 @@ def main():
                     recent = running[-args.log_every:]
                     print(f"  stage {stage} epoch {epoch} step {i}/{len(train_loader)} | "
                           f"loss {sum(recent) / len(recent):.4f}", flush=True)
+                    run.log({"train/loss": sum(recent) / len(recent), "train/lr": lr,
+                             "stage": stage, "epoch": epoch}, step=step)
 
             val_loss, accuracy = evaluate(model, criterion, val_loader, device)
             mean_acc = sum(accuracy.values()) / len(accuracy)
@@ -302,6 +327,9 @@ def main():
                 f.write(json.dumps(dict(stage=stage, epoch=epoch, step=step,
                                         train_loss=sum(running) / len(running), val_loss=val_loss,
                                         val_accuracy=mean_acc, **accuracy)) + "\n")
+            run.log({"train/epoch_loss": sum(running) / len(running), "val/loss": val_loss,
+                     "val/accuracy": mean_acc, "stage": stage, "epoch": epoch,
+                     **{f"val/accuracy/{t}": a for t, a in accuracy.items()}}, step=step)
 
         # Saved before the length evaluation, so a failure at 8k cannot lose the stage.
         # The same layout as the RULER checkpoints, plus what a later stage needs to continue.
@@ -319,6 +347,12 @@ def main():
         with open(metrics_path, "a") as f:
             f.write(json.dumps(dict(stage=stage, step=step, train_len=args.train_len,
                                     accuracy_by_length=by_length)) + "\n")
+        by_length_log = {}
+        for length, result in by_length.items():
+            by_length_log[f"eval/accuracy/len{length}"] = result["mean"]
+            by_length_log.update({f"eval/len{length}/{t}": a for t, a in result.items() if t != "mean"})
+        run.log(by_length_log, step=step)
+    run.finish()
 
 
 if __name__ == "__main__":

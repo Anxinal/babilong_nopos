@@ -1,0 +1,17 @@
+# Dependencies for train_stages.py / run_stages.sh (the tmodel training runs).
+#
+# Separate from requirements.txt, which pins the upstream BABILong evaluation stack
+# (torch 2.3.1, transformers 4.44.2); tmodel/roformer needs transformers>=5.
+# run_stages.sh builds a virtualenv from this file on first use.
+#
+# Install torch separately if you need a specific CUDA build:
+#   TORCH_SPEC='torch --index-url https://download.pytorch.org/whl/cu121' bash run_stages.sh
+
+torch>=2.1
+transformers>=5.17    # AutoTokenizer; >=5 for tmodel/roformer
+datasets>=2.19        # PG19 noise text
+wandb>=0.19
+torch_geometric>=2.8  # sinusoidal encoding for --pe sinusoidal
+numpy>=1.24
+pandas>=2.0           # imported by babilong/babilong_utils.py
+nltk>=3.8             # sentence splitting of the noise text
